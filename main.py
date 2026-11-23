@@ -1,60 +1,111 @@
 
-from collections import Counter
-from itertools import count
+from datetime import datetime
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import Depends, FastAPI, HTTPException, Response
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
-app = FastAPI(title="Event Platform API")
+from db import get_db
+from models import EventRecord
 
 EventType = Literal["click", "page_view", "purchase"]
 
+
 class EventCreate(BaseModel):
-    source: str = Field(min_length=2)
+    source: str = Field(min_length=2, max_length=100)
     event_type: EventType
     value: float = Field(ge=0)
 
-class Event(EventCreate):
-    id: int
 
-events: dict[int, Event] = {}
-next_id = count(1)
+class EventRead(EventCreate):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    created_at: datetime
+
+
+app = FastAPI(title="Event Platform API")
+
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-@app.post("/events", response_model=Event, status_code=201)
-def create_event(payload: EventCreate):
-    event = Event(
-        id=next(next_id),
-        **payload.model_dump()
-    )
-    events[event.id] = event
-    return event
 
-@app.get("/events", response_model=list[Event])
-def list_events(event_type: EventType | None = None):
-    return [
-        event for event in events.values()
-        if event_type is None
-        or event.event_type == event_type
-    ]
+@app.post("/events", response_model=EventRead, status_code=201)
+def create_event(
+    payload: EventCreate,
+    session: Session = Depends(get_db)
+):
+    record = EventRecord(**payload.model_dump())
 
-@app.get("/events/{event_id}", response_model=Event)
-def get_event(event_id: int):
-    event = events.get(event_id)
-    if event is None:
+    session.add(record)
+    session.commit()
+    session.refresh(record)
+
+    return record
+
+
+@app.get("/events", response_model=list[EventRead])
+def list_events(
+    session: Session = Depends(get_db),
+    event_type: EventType | None = None
+):
+    stmt = select(EventRecord).order_by(EventRecord.id)
+
+    if event_type is not None:
+        stmt = stmt.where(
+            EventRecord.event_type == event_type
+        )
+
+    return session.scalars(stmt).all()
+
+
+@app.get("/events/{event_id}", response_model=EventRead)
+def get_event(
+    event_id: int,
+    session: Session = Depends(get_db)
+):
+    record = session.get(EventRecord, event_id)
+
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Event not found"
+        )
+
+    return record
+
+@app.delete("/events/{event_id}", status_code=204, response_class=Response)
+def delete_event(
+    event_id: int,
+    session: Session = Depends(get_db),
+) -> Response:
+    record = session.get(EventRecord, event_id)
+
+    if record is None:
         raise HTTPException(status_code=404, detail="Event not found")
-    return event
+
+    session.delete(record)
+    session.commit()
+
+    return Response(status_code=204)
 
 @app.get("/metrics")
-def get_metrics():
-    counts = Counter(
-        event.event_type for event in events.values()
-    )
+def get_metrics(session: Session = Depends(get_db)):
+    rows = session.execute(
+        select(
+            EventRecord.event_type,
+            func.count(EventRecord.id)
+        ).group_by(EventRecord.event_type)
+    ).all()
+
     return {
-        "total_events": len(events),
-        "by_type": dict(counts)
+        "total_events": sum(count for _, count in rows),
+        "by_type": {
+            event_type: count
+            for event_type, count in rows
+        }
     }
