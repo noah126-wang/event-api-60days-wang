@@ -10,6 +10,9 @@ from sqlalchemy.orm import Session
 from db import get_db
 from models import EventRecord
 
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+
 EventType = Literal["click", "page_view", "purchase"]
 
 
@@ -32,6 +35,18 @@ app = FastAPI(title="Event Platform API")
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.get("/db-health", responses={503: {"description": "Database unavailable"}})
+def db_health(session: Session = Depends(get_db)) -> dict[str, str]:
+    try:
+        session.execute(text("SELECT 1"))
+    except SQLAlchemyError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Database unavailable",
+        ) from exc
+
+    return {"database": "connected"}
 
 
 @app.post("/events", response_model=EventRead, status_code=201)
