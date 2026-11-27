@@ -13,6 +13,15 @@ from models import EventRecord
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+from fastapi import BackgroundTasks
+from tasks import record_recent_event
+
+from cache import (
+    get_cached_metrics,
+    set_cached_metrics,
+    invalidate_metrics_cache,
+)
+
 EventType = Literal["click", "page_view", "purchase"]
 
 
@@ -49,18 +58,32 @@ def db_health(session: Session = Depends(get_db)) -> dict[str, str]:
     return {"database": "connected"}
 
 
-@app.post("/events", response_model=EventRead, status_code=201)
+@app.post(
+    "/events",
+    response_model=EventRead,
+    status_code=201,
+)
 def create_event(
     payload: EventCreate,
-    session: Session = Depends(get_db)
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
 ):
-    record = EventRecord(**payload.model_dump())
+    event = EventRecord(**payload.model_dump())
 
-    session.add(record)
-    session.commit()
-    session.refresh(record)
+    db.add(event)
+    db.commit()
+    db.refresh(event)
 
-    return record
+    invalidate_metrics_cache()
+
+    background_tasks.add_task(
+        record_recent_event,
+        event.id,
+        event.event_type,
+        event.source,
+    )
+
+    return event
 
 
 @app.get("/events", response_model=list[EventRead])
@@ -108,19 +131,37 @@ def delete_event(
 
     return Response(status_code=204)
 
+
 @app.get("/metrics")
-def get_metrics(session: Session = Depends(get_db)):
-    rows = session.execute(
+def get_metrics(
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    cached, cache_state = get_cached_metrics()
+
+    response.headers["X-Cache"] = cache_state
+
+    if cached is not None:
+        return cached
+
+    rows = db.execute(
         select(
             EventRecord.event_type,
-            func.count(EventRecord.id)
+            func.count(EventRecord.id),
         ).group_by(EventRecord.event_type)
     ).all()
 
-    return {
-        "total_events": sum(count for _, count in rows),
-        "by_type": {
-            event_type: count
-            for event_type, count in rows
-        }
+    counts = {
+        event_type: count
+        for event_type, count in rows
     }
+
+    result = {
+        "total": sum(counts.values()),
+        "by_type": counts,
+    }
+
+    set_cached_metrics(result)
+
+    return result
+
